@@ -583,14 +583,12 @@ static void apply_roi_map(VP9_COMP *cpi) {
   const int *delta_q = roi->delta_q;
   const int *delta_lf = roi->delta_lf;
   const int *skip = roi->skip;
+  const int is_intra_only = frame_is_intra_only(cm);
   int ref_frame[8];
   int internal_delta_q[MAX_SEGMENTS];
   int i;
 
-  // TODO(jianj): Investigate why ROI not working in speed < 5 or in non
-  // realtime mode.
-  if (cpi->oxcf.mode != REALTIME || cpi->oxcf.speed < 5) return;
-  if (!roi->enabled) return;
+  if (!roi->enabled || roi->roi_map == NULL) return;
 
   memcpy(&ref_frame, roi->ref_frame, sizeof(ref_frame));
 
@@ -615,11 +613,12 @@ static void apply_roi_map(VP9_COMP *cpi) {
       vp9_enable_segfeature(seg, i, SEG_LVL_ALT_LF);
       vp9_set_segdata(seg, i, SEG_LVL_ALT_LF, delta_lf[i]);
     }
-    if (skip[i] != 0) {
+    // Inter-only features cannot be applied on an intra-only frame.
+    if (!is_intra_only && skip[i] != 0) {
       vp9_enable_segfeature(seg, i, SEG_LVL_SKIP);
       vp9_set_segdata(seg, i, SEG_LVL_SKIP, 0);
     }
-    if (ref_frame[i] >= 0) {
+    if (!is_intra_only && ref_frame[i] >= 0) {
       int valid_ref = 1;
       // ALTREF is not used as reference for nonrd_pickmode with 0 lag.
       if (ref_frame[i] == ALTREF_FRAME && cpi->sf.use_nonrd_pick_mode)
@@ -652,7 +651,7 @@ static void init_level_info(Vp9LevelInfo *level_info) {
   level_spec->min_altref_distance = INT_MAX;
 }
 
-static int check_seg_range(int seg_data[8], int range) {
+static int check_seg_range(const int seg_data[8], int range) {
   int i;
   for (i = 0; i < 8; ++i) {
     // Note abs() alone can't be used as the behavior of abs(INT_MIN) is
@@ -690,10 +689,44 @@ VP9_LEVEL vp9_get_level(const Vp9LevelSpec *const level_spec) {
   return (i == VP9_LEVELS) ? LEVEL_UNKNOWN : vp9_level_defs[i].level;
 }
 
-vpx_codec_err_t vp9_set_roi_map(VP9_COMP *cpi, unsigned char *map,
-                                unsigned int rows, unsigned int cols,
-                                int delta_q[8], int delta_lf[8], int skip[8],
-                                int ref_frame[8]) {
+// Build a segmentation map and the corresponding per-segment quantizer offsets
+// from a per-block QP offset map and/or a binary ROI mask.  VP9 only supports 8
+// segment quantizer values, so at most 8 distinct offsets can be represented.
+static vpx_codec_err_t build_roi_from_block_values(
+    const vpx_roi_map_t *input, unsigned char *segment_map,
+    int delta_q[MAX_SEGMENTS]) {
+  const size_t num_blocks = (size_t)input->rows * input->cols;
+  int offsets[MAX_SEGMENTS];
+  int num_offsets = 0;
+  size_t i;
+
+  memset(delta_q, 0, MAX_SEGMENTS * sizeof(delta_q[0]));
+
+  for (i = 0; i < num_blocks; ++i) {
+    int offset = 0;
+    int segment_id;
+
+    if (input->qp_offset_map != NULL) offset = input->qp_offset_map[i];
+    if (input->roi_mask != NULL && input->roi_mask[i] != 0)
+      offset += input->roi_qp_offset;
+    offset = clamp(offset, -63, 63);
+
+    for (segment_id = 0; segment_id < num_offsets; ++segment_id) {
+      if (offsets[segment_id] == offset) break;
+    }
+    if (segment_id == num_offsets) {
+      if (num_offsets == MAX_SEGMENTS) return VPX_CODEC_INVALID_PARAM;
+      offsets[num_offsets] = offset;
+      delta_q[num_offsets] = offset;
+      ++num_offsets;
+    }
+    segment_map[i] = (unsigned char)segment_id;
+  }
+
+  return VPX_CODEC_OK;
+}
+
+vpx_codec_err_t vp9_set_roi_map(VP9_COMP *cpi, const vpx_roi_map_t *input) {
   VP9_COMMON *cm = &cpi->common;
   vpx_roi_map_t *roi = &cpi->roi;
   const int range = 63;
@@ -701,53 +734,103 @@ vpx_codec_err_t vp9_set_roi_map(VP9_COMP *cpi, unsigned char *map,
   const int skip_range = 1;
   const int frame_rows = cpi->common.mi_rows;
   const int frame_cols = cpi->common.mi_cols;
+  int derived_delta_q[MAX_SEGMENTS];
+  int ref_frame[MAX_SEGMENTS];
+  int has_block_values;
+  unsigned char *segment_map;
+  size_t num_blocks;
+  size_t i;
 
-  // Check number of rows and columns match
-  if (frame_rows != (int)rows || frame_cols != (int)cols) {
-    return VPX_CODEC_INVALID_PARAM;
+  if (input == NULL) return VPX_CODEC_INVALID_PARAM;
+  has_block_values = input->qp_offset_map != NULL || input->roi_mask != NULL;
+  memcpy(ref_frame, input->ref_frame, sizeof(ref_frame));
+
+  // A zero-initialized per-block map is the common case.  For that input
+  // form, ref_frame[] == 0 means "not specified" rather than "force intra".
+  if (has_block_values && ref_frame[0] == 0 && ref_frame[1] == 0 &&
+      ref_frame[2] == 0 && ref_frame[3] == 0 && ref_frame[4] == 0 &&
+      ref_frame[5] == 0 && ref_frame[6] == 0 && ref_frame[7] == 0) {
+    memset(ref_frame, -1, sizeof(ref_frame));
   }
 
-  if (!check_seg_range(delta_q, range) || !check_seg_range(delta_lf, range) ||
+  // Check number of rows and columns match.
+  if (input->rows != (unsigned int)frame_rows ||
+      input->cols != (unsigned int)frame_cols) {
+    return VPX_CODEC_INVALID_PARAM;
+  }
+  num_blocks = (size_t)input->rows * input->cols;
+
+  if ((!has_block_values && !check_seg_range(input->delta_q, range)) ||
+      !check_seg_range(input->delta_lf, range) ||
       !check_seg_range(ref_frame, ref_frame_range) ||
-      !check_seg_range(skip, skip_range))
+      !check_seg_range(input->skip, skip_range) ||
+      input->roi_qp_offset < -range || input->roi_qp_offset > range)
     return VPX_CODEC_INVALID_PARAM;
 
-  // Also disable segmentation if no deltas are specified.
-  if (!map ||
-      (!(delta_q[0] | delta_q[1] | delta_q[2] | delta_q[3] | delta_q[4] |
-         delta_q[5] | delta_q[6] | delta_q[7] | delta_lf[0] | delta_lf[1] |
-         delta_lf[2] | delta_lf[3] | delta_lf[4] | delta_lf[5] | delta_lf[6] |
-         delta_lf[7] | skip[0] | skip[1] | skip[2] | skip[3] | skip[4] |
-         skip[5] | skip[6] | skip[7]) &&
-       (ref_frame[0] == -1 && ref_frame[1] == -1 && ref_frame[2] == -1 &&
-        ref_frame[3] == -1 && ref_frame[4] == -1 && ref_frame[5] == -1 &&
-        ref_frame[6] == -1 && ref_frame[7] == -1))) {
+  if (input->qp_offset_map != NULL) {
+    for (i = 0; i < num_blocks; ++i) {
+      const int offset = input->qp_offset_map[i];
+      if (offset < -range || offset > range) return VPX_CODEC_INVALID_PARAM;
+    }
+  }
+
+  if (!has_block_values && input->roi_map != NULL) {
+    // Each byte of the map is used as a segment id and must be in range.
+    for (i = 0; i < num_blocks; ++i) {
+      if (input->roi_map[i] >= MAX_SEGMENTS) return VPX_CODEC_INVALID_PARAM;
+    }
+  }
+
+  // Also disable segmentation if no map and no deltas are specified.
+  if ((!has_block_values && input->roi_map == NULL) ||
+      (!has_block_values &&
+       !(input->delta_q[0] | input->delta_q[1] | input->delta_q[2] |
+         input->delta_q[3] | input->delta_q[4] | input->delta_q[5] |
+         input->delta_q[6] | input->delta_q[7] | input->delta_lf[0] |
+         input->delta_lf[1] | input->delta_lf[2] | input->delta_lf[3] |
+         input->delta_lf[4] | input->delta_lf[5] | input->delta_lf[6] |
+         input->delta_lf[7] | input->skip[0] | input->skip[1] |
+         input->skip[2] | input->skip[3] | input->skip[4] | input->skip[5] |
+         input->skip[6] | input->skip[7]) &&
+       (input->ref_frame[0] == -1 && input->ref_frame[1] == -1 &&
+        input->ref_frame[2] == -1 && input->ref_frame[3] == -1 &&
+        input->ref_frame[4] == -1 && input->ref_frame[5] == -1 &&
+        input->ref_frame[6] == -1 && input->ref_frame[7] == -1))) {
     vp9_disable_segmentation(&cm->seg);
     cpi->roi.enabled = 0;
     return VPX_CODEC_OK;
   }
 
-  // Each byte of the map is used as a segment id and must be in range.
-  for (unsigned int i = 0; i < rows * cols; ++i) {
-    if (map[i] >= MAX_SEGMENTS) return VPX_CODEC_INVALID_PARAM;
+  segment_map = (unsigned char *)vpx_malloc(num_blocks);
+  if (segment_map == NULL) return VPX_CODEC_MEM_ERROR;
+
+  if (has_block_values) {
+    const vpx_codec_err_t status =
+        build_roi_from_block_values(input, segment_map, derived_delta_q);
+    if (status != VPX_CODEC_OK) {
+      vpx_free(segment_map);
+      return status;
+    }
+    memcpy(roi->delta_q, derived_delta_q,
+           MAX_SEGMENTS * sizeof(derived_delta_q[0]));
+  } else {
+    memcpy(segment_map, input->roi_map, num_blocks);
+    memcpy(roi->delta_q, input->delta_q,
+           MAX_SEGMENTS * sizeof(input->delta_q[0]));
   }
 
-  if (roi->roi_map) {
+  if (roi->roi_map != NULL) {
     vpx_free(roi->roi_map);
     roi->roi_map = NULL;
   }
-  roi->roi_map = vpx_malloc(rows * cols);
-  if (!roi->roi_map) return VPX_CODEC_MEM_ERROR;
-
-  // Copy to ROI structure in the compressor.
-  memcpy(roi->roi_map, map, rows * cols);
-  memcpy(&roi->delta_q, delta_q, MAX_SEGMENTS * sizeof(delta_q[0]));
-  memcpy(&roi->delta_lf, delta_lf, MAX_SEGMENTS * sizeof(delta_lf[0]));
-  memcpy(&roi->skip, skip, MAX_SEGMENTS * sizeof(skip[0]));
-  memcpy(&roi->ref_frame, ref_frame, MAX_SEGMENTS * sizeof(ref_frame[0]));
+  roi->roi_map = segment_map;
+  memcpy(roi->delta_lf, input->delta_lf,
+         MAX_SEGMENTS * sizeof(input->delta_lf[0]));
+  memcpy(roi->skip, input->skip, MAX_SEGMENTS * sizeof(input->skip[0]));
+  memcpy(roi->ref_frame, ref_frame, MAX_SEGMENTS * sizeof(ref_frame[0]));
   roi->enabled = 1;
-  roi->rows = rows;
-  roi->cols = cols;
+  roi->rows = input->rows;
+  roi->cols = input->cols;
 
   return VPX_CODEC_OK;
 }
@@ -4249,27 +4332,25 @@ static int encode_without_recode_loop(VP9_COMP *cpi, size_t *size,
     // it may be pretty bad for rate-control,
     // and I should handle it somehow
     vp9_alt_ref_aq_setup_map(cpi->alt_ref_aq, cpi);
-  } else {
-#endif
-    // If ROI is enabled and skip feature is used for segmentation, apply cyclic
-    // refresh but not apply ROI for skip for the first 20 frames (defined by
-    // FRAMES_NO_SKIPPING_AFTER_KEY) after key frame to improve quality.
-    if (cpi->roi.enabled && !frame_is_intra_only(cm)) {
-      if (cpi->roi.skip[BACKGROUND_SEG_SKIP_ID]) {
-        if (cpi->oxcf.aq_mode == CYCLIC_REFRESH_AQ)
-          vp9_cyclic_refresh_setup(cpi);
-        if (cpi->rc.frames_since_key > FRAMES_NO_SKIPPING_AFTER_KEY)
-          apply_roi_map(cpi);
-      } else {
-        apply_roi_map(cpi);
-      }
-    } else if (cpi->oxcf.aq_mode == CYCLIC_REFRESH_AQ) {
-      vp9_cyclic_refresh_setup(cpi);
-    }
-
-#if !CONFIG_REALTIME_ONLY
   }
 #endif
+
+  // Keep cyclic refresh bookkeeping up to date before ROI overrides the
+  // segmentation map and features.
+  if (cpi->oxcf.aq_mode == CYCLIC_REFRESH_AQ)
+    vp9_cyclic_refresh_setup(cpi);
+
+  // If ROI is enabled and skip feature is used for segmentation, do not apply
+  // ROI for skip for the first 20 frames (defined by
+  // FRAMES_NO_SKIPPING_AFTER_KEY) after key frame to improve quality.
+  if (cpi->roi.enabled) {
+    if (!frame_is_intra_only(cm) && cpi->roi.skip[BACKGROUND_SEG_SKIP_ID]) {
+      if (cpi->rc.frames_since_key > FRAMES_NO_SKIPPING_AFTER_KEY)
+        apply_roi_map(cpi);
+    } else {
+      apply_roi_map(cpi);
+    }
+  }
 
   apply_active_map(cpi);
 
@@ -4507,6 +4588,11 @@ static void encode_with_recode_loop(VP9_COMP *cpi, size_t *size, uint8_t *dest,
     } else if (oxcf->aq_mode == PSNR_AQ) {
       vp9_psnr_aq_mode_setup(&cm->seg);
     }
+
+    // Apply the ROI after the AQ setup so that per-block offsets take
+    // precedence over AQ segmentation.  The frame base quantizer still comes
+    // from the rate controller.
+    if (cpi->roi.enabled) apply_roi_map(cpi);
 
     vp9_encode_frame(cpi);
 

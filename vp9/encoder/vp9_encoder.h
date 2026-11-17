@@ -1210,10 +1210,7 @@ static INLINE int log_tile_cols_from_picsize_level(uint32_t width,
 
 VP9_LEVEL vp9_get_level(const Vp9LevelSpec *const level_spec);
 
-vpx_codec_err_t vp9_set_roi_map(VP9_COMP *cpi, unsigned char *map,
-                                unsigned int rows, unsigned int cols,
-                                int delta_q[8], int delta_lf[8], int skip[8],
-                                int ref_frame[8]);
+vpx_codec_err_t vp9_set_roi_map(VP9_COMP *cpi, const vpx_roi_map_t *roi);
 
 void vp9_new_framerate(VP9_COMP *cpi, double framerate);
 

@@ -1835,10 +1835,7 @@ static vpx_codec_err_t ctrl_set_roi_map(vpx_codec_alg_priv_t *ctx,
   vpx_roi_map_t *data = va_arg(args, vpx_roi_map_t *);
 
   if (data) {
-    vpx_roi_map_t *roi = (vpx_roi_map_t *)data;
-    return vp9_set_roi_map(ctx->cpi, roi->roi_map, roi->rows, roi->cols,
-                           roi->delta_q, roi->delta_lf, roi->skip,
-                           roi->ref_frame);
+    return vp9_set_roi_map(ctx->cpi, data);
   }
   return VPX_CODEC_INVALID_PARAM;
 }

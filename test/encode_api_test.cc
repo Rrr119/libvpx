@@ -1699,6 +1699,116 @@ TEST(EncodeAPI, SetRoiInvalidSegmentIdVp9) {
   vpx_img_free(img);
   EXPECT_EQ(vpx_codec_destroy(&enc), VPX_CODEC_OK);
 }
+
+// Verify the per-macroblock QP offset map and binary ROI mask inputs, including
+// validation and encoding with both realtime and good-quality deadlines.
+TEST(EncodeAPI, SetRoiPerMbQpOffsetAndMaskVp9) {
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 64;
+  constexpr int kBlockSize = 8;
+  constexpr int kRows = kHeight / kBlockSize;
+  constexpr int kCols = kWidth / kBlockSize;
+  constexpr int kBlocks = kRows * kCols;
+
+  vpx_image_t *const img =
+      vpx_img_alloc(nullptr, VPX_IMG_FMT_I420, kWidth, kHeight, 32);
+  ASSERT_NE(img, nullptr);
+  for (int plane = 0; plane < 3; ++plane) {
+    const int w = plane ? kWidth / 2 : kWidth;
+    const int h = plane ? kHeight / 2 : kHeight;
+    uint8_t *row = img->planes[plane];
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) row[x] = static_cast<uint8_t>(x * 5 + y * 3);
+      row += img->stride[plane];
+    }
+  }
+
+  signed char qp_offset_map[kBlocks];
+  uint8_t roi_mask[kBlocks];
+  for (int i = 0; i < kBlocks; ++i) {
+    qp_offset_map[i] = static_cast<signed char>((i % 4) * 10 - 15);
+    roi_mask[i] = static_cast<uint8_t>(i % 3 == 0);
+  }
+
+  for (const vpx_enc_deadline_t deadline :
+       { VPX_DL_REALTIME, VPX_DL_GOOD_QUALITY }) {
+    SCOPED_TRACE(deadline == VPX_DL_REALTIME ? "realtime" : "good quality");
+    vpx_codec_ctx_t enc;
+    vpx_codec_enc_cfg_t cfg;
+    ASSERT_EQ(vpx_codec_enc_config_default(vpx_codec_vp9_cx(), &cfg, 0),
+              VPX_CODEC_OK);
+    cfg.g_w = kWidth;
+    cfg.g_h = kHeight;
+    cfg.g_lag_in_frames = 0;
+    cfg.g_pass = VPX_RC_ONE_PASS;
+    cfg.rc_end_usage = VPX_CBR;
+    cfg.rc_target_bitrate = 500;
+    cfg.rc_min_quantizer = 0;
+    cfg.rc_max_quantizer = 63;
+    ASSERT_EQ(vpx_codec_enc_init(&enc, vpx_codec_vp9_cx(), &cfg, 0),
+              VPX_CODEC_OK);
+    ASSERT_EQ(vpx_codec_control(&enc, VP8E_SET_CPUUSED, 0), VPX_CODEC_OK);
+    if (deadline == VPX_DL_REALTIME) {
+      EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_AQ_MODE, 3), VPX_CODEC_OK);
+    }
+
+    vpx_roi_map_t roi = {};
+    roi.rows = kRows;
+    roi.cols = kCols;
+    for (int i = 0; i < 8; ++i) roi.ref_frame[i] = -1;
+
+    // Per-block offsets outside [-63, 63] are rejected.
+    roi.qp_offset_map = qp_offset_map;
+    qp_offset_map[0] = 64;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi),
+              VPX_CODEC_INVALID_PARAM);
+    qp_offset_map[0] = -64;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi),
+              VPX_CODEC_INVALID_PARAM);
+    qp_offset_map[0] = -15;
+
+    // VP9 can represent at most 8 distinct per-block offsets.
+    for (int i = 0; i < kBlocks; ++i) qp_offset_map[i] = i < 9 ? i : 0;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi),
+              VPX_CODEC_INVALID_PARAM);
+    for (int i = 0; i < kBlocks; ++i) {
+      qp_offset_map[i] = static_cast<signed char>((i % 4) * 10 - 15);
+    }
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi), VPX_CODEC_OK);
+
+    // The binary ROI mask uses its own offset and is validated as well.
+    roi.qp_offset_map = nullptr;
+    roi.roi_mask = roi_mask;
+    roi.roi_qp_offset = -64;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi),
+              VPX_CODEC_INVALID_PARAM);
+    roi.roi_qp_offset = -30;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi), VPX_CODEC_OK);
+
+    // Both inputs may be combined; the mask offset is added to the per-block
+    // offset and the result is clamped to the VP9 segment delta range.
+    roi.qp_offset_map = qp_offset_map;
+    qp_offset_map[0] = 50;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi), VPX_CODEC_OK);
+
+    // Rows/columns must describe the full frame.
+    roi.rows = kRows - 1;
+    EXPECT_EQ(vpx_codec_control(&enc, VP9E_SET_ROI_MAP, &roi),
+              VPX_CODEC_INVALID_PARAM);
+    roi.rows = kRows;
+
+    for (int frame = 0; frame < 2; ++frame) {
+      ASSERT_EQ(vpx_codec_encode(&enc, img, frame, 1, 0, deadline),
+                VPX_CODEC_OK);
+      vpx_codec_iter_t iter = nullptr;
+      while (vpx_codec_get_cx_data(&enc, &iter) != nullptr) {
+      }
+    }
+    EXPECT_EQ(vpx_codec_destroy(&enc), VPX_CODEC_OK);
+  }
+
+  vpx_img_free(img);
+}
 #endif  // CONFIG_VP9_ENCODER
 
 TEST(EncodeAPI, ConfigChangeThreadCount) {

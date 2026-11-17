@@ -447,7 +447,25 @@ enum vp8e_enc_control_id {
    */
   VP9E_SET_SVC,
 
-  /*!\brief Codec control function to pass an ROI map to encoder.
+  /*!\brief Codec control function to set a region of interest (ROI) map.
+   *
+   * The argument is a pointer to #vpx_roi_map_t.  For VP9, #roi_map assigns a
+   * segment id to every 8x8 block.  Alternatively, #qp_offset_map supplies a
+   * signed quantizer offset for every 8x8 block, and #roi_mask supplies a
+   * binary mask where a non-zero value selects blocks for #roi_qp_offset.
+   * #qp_offset_map and #roi_mask take precedence over #roi_map and #delta_q.
+   * Up to 8 distinct quantizer offsets can be represented.
+   *
+   * The offsets are relative to the frame base quantizer selected by the rate
+   * controller.  The frame target bitrate and base quantizer are unchanged, so
+   * the control can be used with CBR, VBR, CQ and constant-Q rate control.
+   * ROI encoding is supported in realtime and good-quality modes, at all
+   * encoder speeds, and on key frames.  Skip and reference-frame features are
+   * ignored on intra-only frames.  For #qp_offset_map and #roi_mask inputs, an
+   * all-zero #ref_frame array is treated as "not specified".
+   *
+   * \note Valid range for quantizer offsets: -63..63 (negative values improve
+   *       quality).  Default is 0 (no offset).
    *
    * Supported in codecs: VP9
    */
@@ -827,26 +845,64 @@ typedef enum vp9e_temporal_layering_mode {
 
 /*!\brief  vpx region of interest map
  *
- * These defines the data structures for the region of interest map
+ * These defines the data structures for the region of interest map.  A ROI
+ * map assigns a segment id to every 8x8 block (VP9) or 16x16 block (VP8).
+ * The segment id selects the per-segment values, such as quantizer and loop
+ * filter deltas, from the arrays below.
  *
+ * For VP9 the map can also be supplied as a per-block quantizer offset map
+ * (#qp_offset_map) and/or a binary ROI mask (#roi_mask).  When either of
+ * these is non-NULL the encoder derives the segment ids from the corresponding
+ * per-block values.  The #roi_map and #delta_q arrays are then ignored.
+ *
+ * The quantizer offsets are relative to the frame quantizer selected by the
+ * rate controller.  They do not change the frame-level target bitrate or the
+ * frame base quantizer, so ROI encoding remains compatible with the normal
+ * CBR, VBR, CQ and constant-Q rate control modes.
  */
 
 typedef struct vpx_roi_map {
   /*! If ROI is enabled. */
   uint8_t enabled;
   /*! An id between 0-3 (0-7 for vp9) for each 16x16 (8x8 for VP9)
-   * region within a frame. */
+   * region within a frame.  Ignored when #qp_offset_map or #roi_mask is set.
+   */
   unsigned char *roi_map;
-  unsigned int rows; /**< Number of rows. */
-  unsigned int cols; /**< Number of columns. */
+  /*! Number of block rows: (frame height + block size - 1) / block size. */
+  unsigned int rows;
+  /*! Number of block columns: (frame width + block size - 1) / block size. */
+  unsigned int cols;
   /*! VP8 only uses the first 4 segments. VP9 uses 8 segments. */
-  int delta_q[8];  /**< Quantizer deltas. Valid range: [-63, 63].*/
-  int delta_lf[8]; /**< Loop filter deltas. Valid range: [-63, 63].*/
+  int delta_q[8]; /**< Quantizer deltas. Valid range: [-63, 63]. */
+  int delta_lf[8]; /**< Loop filter deltas. Valid range: [-63, 63]. */
   /*! skip and ref frame segment is only used in VP9. */
   int skip[8];      /**< Skip this block. */
   int ref_frame[8]; /**< Reference frame for this block. */
   /*! Static breakout threshold for each segment. Only used in VP8. */
   unsigned int static_threshold[4];
+  /*! Optional per-block quantizer offset map. Only used in VP9.
+   *
+   * One signed byte per 8x8 block in raster order, with the same dimensions as
+   * #roi_map.  The value is a quantizer offset relative to the frame base
+   * quantizer and must be in the range [-63, 63].  At most 8 distinct offsets
+   * are supported because VP9 signals quantizer offsets through segmentation.
+   * A value of 0 keeps the frame quantizer.  When this map is set, it takes
+   * precedence over #roi_map and #delta_q.
+   */
+  signed char *qp_offset_map;
+  /*! Optional binary ROI mask. Only used in VP9.
+   *
+   * One byte per 8x8 block in raster order, with the same dimensions as
+   * #roi_map.  A non-zero value marks the block as ROI and applies
+   * #roi_qp_offset to it.  A zero value keeps the frame quantizer.  When this
+   * mask is set, it takes precedence over #roi_map and #delta_q.  If both
+   * #qp_offset_map and #roi_mask are set, #roi_qp_offset is added to the
+   * per-block offsets in #qp_offset_map for the masked blocks.
+   */
+  unsigned char *roi_mask;
+  /*! Quantizer offset applied to blocks selected by #roi_mask. Only used in
+   * VP9.  Valid range: [-63, 63].  Negative values increase quality. */
+  int roi_qp_offset;
 } vpx_roi_map_t;
 
 /*!\brief  vpx active region map
